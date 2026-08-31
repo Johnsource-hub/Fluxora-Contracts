@@ -14,10 +14,10 @@ subscription billing, vesting schedules. The contract is the product.
 | SDK | `soroban-sdk` 27.0.5 |
 | Rust | 1.97.1, target `wasm32v1-none` |
 | Token interface | SEP-41 (USDC on Stellar has **7 decimals**) |
-| Contract size | ~47 KB |
+| Contract size | ~47 KiB baseline; enforced by `contracts/stream/wasm-size-budget.env` |
 | Tests | 146, including property tests and a pool invariant checked after every operation |
 
-> **Read [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) before relying on this.**
+> **Read [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) before relying on this.**
 > A green suite here does not mean TTL is solved — the archival *recovery* flow
 > is not yet proven against a live network. See §1 there, and the summary below.
 
@@ -28,11 +28,42 @@ subscription billing, vesting schedules. The contract is the product.
 ```bash
 cargo test                                    # full suite
 cargo test resource_limits -- --nocapture     # print measured resource costs
-cargo build --target wasm32v1-none --release  # build the contract
 
 # Deeper randomized sweep. CI runs this nightly; worth running before a release
 # or after touching accrual.rs. Both suites have found real bugs.
 FLUXORA_FUZZ_SEEDS=200 FLUXORA_FUZZ_STEPS=300 PROPTEST_CASES=5000 cargo test --release
+```
+
+## Building and releasing
+
+The **product** contract (`contracts/stream`) builds to `fluxora_stream.wasm`.
+
+**Release artifacts come from `script/release.sh` only.** It builds exactly the
+product package, downloads nothing else, and refuses to produce an artifact if the
+archival probe's wasm would be swept in:
+
+```bash
+script/release.sh      # -> target/wasm32v1-none/release/fluxora_stream.wasm (only)
+```
+
+> The archival probe (see below) is a workspace member so its smoke test stays
+> wired into `cargo test`, but it is deliberately excluded from release artifacts.
+> Never deploy it to mainnet. See
+> [`contracts/archival-probe/src/lib.rs`](contracts/archival-probe/src/lib.rs).
+
+---
+
+## Release integrity
+
+Every contract wasm is released with a provenance manifest tying its bytes to
+the git revision, Rust toolchain, soroban-sdk version, target triple and
+release profile, plus a SHA-256 digest per artifact (see
+[docs/provenance.md](docs/provenance.md)). Verification is mandatory — a
+mismatch fails the release:
+
+```bash
+script/provenance.sh build   # wasm build + generate + verify (the release gate)
+script/provenance.sh verify  # re-check the current build
 ```
 
 ---
@@ -158,7 +189,7 @@ lowers the rate and therefore retroactively *reduces* the amount already vested 
 letting `withdrawn` exceed `vested`, and letting a subsequent `cancel` (which
 sets `deposited = vested`) drive liability negative and refund the sender money
 the recipient already holds. This was a real bug, caught by the randomized
-sequence suite; see [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for the class of
+sequence suite; see [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) for the class of
 issue and `test::top_up::a_top_up_never_reduces_what_is_already_vested` for the
 regression. Rounding down guarantees `vested` never decreases; the residual is at
 most one second of schedule, in the recipient's favour.
@@ -292,7 +323,7 @@ costs.
 
 **TTL is therefore half-proven.** Closing the other half against live testnet is
 the acceptance criterion for stage 4, not a nice-to-have. Full detail and
-integrator guidance in [KNOWN-LIMITATIONS.md §1](KNOWN-LIMITATIONS.md).
+integrator guidance in [docs/KNOWN-LIMITATIONS.md §1](docs/KNOWN-LIMITATIONS.md).
 
 ---
 
@@ -360,6 +391,27 @@ storage, no host calls. That keeps the interesting arithmetic in one auditable
 place and makes the vesting model property-testable without a Soroban host, so a
 case costs microseconds instead of a host invocation.
 
+### The archival probe: a deliberate exception
+
+`contracts/archival-probe/` is a **throwaway** contract, not part of the product.
+Its entire purpose is to prove the live-network archival/restore round trip that
+the unit suite structurally cannot (see [KNOWN-LIMITATIONS.md §1](KNOWN-LIMITATIONS.md)
+and [`script/archival-canary.sh`](script/archival-canary.sh)). It writes a
+persistent entry and deliberately never extends its TTL, so it archives on the
+network's minimum schedule.
+
+It remains a **workspace member** — so `cargo test --workspace`, `cargo fmt --all`
+and `cargo clippy --all-targets` keep covering its smoke test — but it is
+**explicitly excluded from release artifacts**: `script/release.sh` builds only the
+`fluxora-stream` package and rejects a probe wasm among its outputs. To build the
+probe on its own, use the explicit command:
+
+```bash
+cargo build -p fluxora-archival-probe --target wasm32v1-none --release
+```
+
+This is the documented design decision for issue #1543.
+
 ---
 
 ## Non-goals for v1
@@ -381,12 +433,12 @@ and passes 35/35 assertions.
 
 Its acceptance criterion — the live archival restore round trip — is **not yet
 met**. A canary entry was planted on 2026-08-12 and archives ~2026-08-19; see
-[KNOWN-LIMITATIONS.md §1](KNOWN-LIMITATIONS.md) and
+[docs/KNOWN-LIMITATIONS.md §1](docs/KNOWN-LIMITATIONS.md) and
 `script/archival-canary.sh`.
 
 Then the indexer, keeper and TypeScript SDK (stage 5), reference UI last (stage 6).
 
-Migrating from the pre-rewrite contract? See [MIGRATION.md](MIGRATION.md) — the
+Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.md) — the
 frontend's four contract calls all break, the backend is unaffected.
 
 ## Documents
@@ -394,11 +446,13 @@ frontend's four contract calls all break, the backend is unaffected.
 | | |
 |---|---|
 | [docs/ABI.md](docs/ABI.md) | **Interface of record.** Frozen 2026-08-12. Read this before integrating. |
-| [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
-| [MIGRATION.md](MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
+| [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
+| [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
 | [docs/soroban-rpc-read-skew.md](docs/soroban-rpc-read-skew.md) | Pin multi-call reads to one ledger, and the read-after-write barrier. |
+| [docs/provenance.md](docs/provenance.md) | Wasm provenance schema, design decisions, and the release gate. |
 | [fluxora-build-spec.md](fluxora-build-spec.md) | The build spec, with amendments where measurement contradicted it. |
 
 > **Note for deployment:** the `stellar` CLI must be at least version 27 to match
 > the protocol. A protocol-23 CLI will scaffold and may misreport against a
 > protocol-27 network.
+

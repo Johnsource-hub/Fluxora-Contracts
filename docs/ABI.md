@@ -46,7 +46,14 @@ deployed contract via `#[contractevent]` and `#[contractimpl]`. The SDK and
 indexer must codegen from `stellar contract info interface`, not from
 hand-rolled topic parsers. The previous frontend's hand-written
 `nativeToScVal` encoding is exactly the thing that broke; see
-[MIGRATION.md](../MIGRATION.md).
+[MIGRATION.md](MIGRATION.md).
+
+The reviewable inventory of every public method, return type, error
+discriminant and event is generated from that same spec XDR and committed at
+[`contracts/stream/abi/fluxora_stream.json`](../contracts/stream/abi/fluxora_stream.json).
+`test::abi` fails the suite if a method is removed, renamed, or type-changed
+without bumping [`ABI_VERSION`](../contracts/stream/src/lib.rs). Additive
+changes update the snapshot only.
 
 ---
 
@@ -109,9 +116,10 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 8 | `NotCancellable` | | 21 | `DuplicateStreamId` |
 | 9 | `NotPausable` | | 22 | `Overflow` |
 | 10 | `NotTransferable` | | 23 | `TopUpTooSmall` |
-| 11 | `StreamNotActive` | | 25 | `TokenTransferFailed` |
-| 12 | `StreamNotPaused` | | 26 | `TokenMissing` |
-| 13 | `StreamAlreadyPaused` | | | |
+| 11 | `StreamNotActive` | | 24 | `StreamIdExhausted` |
+| 12 | `StreamNotPaused` | | 25 | `TokenTransferFailed` |
+| 13 | `StreamAlreadyPaused` | | 26 | `TokenMissing` |
+| | | | 29 | `MalformedStreamId` |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Fluxora's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
@@ -197,7 +205,7 @@ may emit fewer than 16 events.
 
 ## Resolved schema questions
 
-Both were open against `Fluxora-Backend` in [MIGRATION.md](../MIGRATION.md) §5
+Both were open against `Fluxora-Backend` in [MIGRATION.md](MIGRATION.md) §5
 and are settled here as part of the freeze.
 
 ### 1. `streams.status` — mirror the contract's four values verbatim
@@ -297,4 +305,5 @@ view calls combined into one derived figure (for example checking
 **2. Handle archived streams.** `stream_exists(id) == false` while
 `id < stream_count()` means the entry has been archived, not that it never
 existed. Surface a restore action rather than an error. See
-[KNOWN-LIMITATIONS.md](../KNOWN-LIMITATIONS.md) §1.
+[KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) §1.
+
