@@ -1,10 +1,11 @@
 //! Stage 2 — recipient transfer.
 
-use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+use soroban_sdk::events::Event as _;
+use soroban_sdk::testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke};
 use soroban_sdk::{Address, IntoVal};
 
 use super::common::*;
-use crate::{Error, Stream, StreamStatus};
+use crate::{events, DataKey, Error, Stream, StreamStatus};
 
 fn assert_claim(
     h: &Harness,
@@ -30,6 +31,47 @@ fn assert_only_recipient_changed(before: &Stream, after: &Stream, new_recipient:
     let mut expected = before.clone();
     expected.recipient = new_recipient.clone();
     assert_eq!(after, &expected);
+}
+
+#[test]
+fn transfer_accepts_stream_ids_zero_and_one() {
+    let h = Harness::new();
+    let zero = h.create_simple(1_000 * ONE, 100 * DAY);
+    let one = h.create_simple(1_000 * ONE, 100 * DAY);
+    assert_eq!([zero, one], [0, 1]);
+
+    h.client.transfer_recipient(&zero, &h.other);
+    h.client.transfer_recipient(&one, &h.other);
+
+    assert_eq!(h.get(zero).recipient, h.other);
+    assert_eq!(h.get(one).recipient, h.other);
+}
+
+#[test]
+fn transfer_accepts_max_stream_id_and_refuses_one_past_with_typed_error() {
+    let h = Harness::new();
+    h.env.as_contract(&h.contract_id, || {
+        h.env
+            .storage()
+            .instance()
+            .set(&DataKey::NextStreamId, &(u64::MAX - 1));
+        h.env
+            .storage()
+            .instance()
+            .set(&DataKey::StreamCount, &(u64::MAX - 1));
+    });
+
+    let max_id = h.create_simple(1_000 * ONE, 100 * DAY);
+    assert_eq!(max_id, u64::MAX - 1);
+    h.client.transfer_recipient(&max_id, &h.other);
+    assert_eq!(h.get(max_id).recipient, h.other);
+
+    let error = h
+        .client
+        .try_transfer_recipient(&u64::MAX, &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(error, Error::StreamNotFound);
 }
 
 #[test]
@@ -176,16 +218,178 @@ fn transfer_chains() {
 }
 
 #[test]
-fn transferring_to_the_current_recipient_is_a_no_op() {
+fn transferring_to_the_current_recipient_is_an_error() {
     let h = Harness::new();
     let id = h.create_simple(1_000 * ONE, 100 * DAY);
-    let before = h.get(id);
 
-    h.client.transfer_recipient(&id, &h.recipient);
-    assert_eq!(h.get(id), before);
+    let err = h
+        .client
+        .try_transfer_recipient(&id, &h.recipient)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::RepeatedTransfer);
+}
+
+#[test]
+fn new_recipient_replay_fails_due_to_repeated_transfer() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
 
     h.client.transfer_recipient(&id, &h.other);
-    assert_eq!(h.get(id).recipient, h.other, "a later retry still succeeds");
+
+    // If the transaction is replayed, the current recipient is now h.other.
+    // A replay tries to transfer to h.other again.
+    let err = h
+        .client
+        .try_transfer_recipient(&id, &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::RepeatedTransfer);
+}
+
+// --- Cliff and terminal boundaries ----------------------------------------
+
+/// Transfer immediately before the cliff moves the still-locked claim. The
+/// new recipient cannot withdraw before the cliff, but can claim the accrued
+/// amount as soon as the cliff opens.
+#[test]
+fn transfer_one_second_before_cliff_moves_claim_to_new_recipient() {
+    let h = Harness::new();
+    let start = h.now();
+    let cliff = start + 50 * DAY;
+    let end = start + 100 * DAY;
+    let id = h.create(1_000 * ONE, start, end, cliff, true, true, true);
+
+    h.warp_to(cliff - 1);
+    h.client.transfer_recipient(&id, &h.other);
+
+    let err = h.client.try_withdraw(&id, &None).unwrap_err().unwrap();
+    assert_eq!(err, Error::NothingToWithdraw);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE);
+
+    h.warp_to(cliff);
+    assert_eq!(h.client.withdraw(&id, &None), 500 * ONE);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE + 500 * ONE);
+}
+
+/// The cliff ledger is inclusive: transferring at the exact cliff preserves
+/// the newly opened claim for the recipient who receives the stream.
+#[test]
+fn transfer_at_cliff_preserves_the_open_claim() {
+    let h = Harness::new();
+    let start = h.now();
+    let cliff = start + 50 * DAY;
+    let id = h.create(
+        1_000 * ONE,
+        start,
+        start + 100 * DAY,
+        cliff,
+        true,
+        true,
+        true,
+    );
+
+    h.warp_to(cliff);
+    h.client.transfer_recipient(&id, &h.other);
+
+    assert_eq!(h.client.withdrawable_of(&id), 500 * ONE);
+    assert_eq!(h.client.withdraw(&id, &None), 500 * ONE);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE + 500 * ONE);
+}
+
+/// Transfer after the cliff moves both the already-open claim and all future
+/// accrual; the old recipient receives no payout.
+#[test]
+fn transfer_after_cliff_moves_accrued_and_future_claims() {
+    let h = Harness::new();
+    let start = h.now();
+    let cliff = start + 50 * DAY;
+    let end = start + 100 * DAY;
+    let id = h.create(1_000 * ONE, start, end, cliff, true, true, true);
+
+    h.warp_to(cliff + 1);
+    let accrued = 1_000 * ONE * (50 * DAY + 1) as i128 / (100 * DAY) as i128;
+    h.client.transfer_recipient(&id, &h.other);
+    assert_eq!(h.client.withdraw(&id, &None), accrued);
+
+    h.warp_to(end);
+    assert_eq!(h.client.withdraw(&id, &None), 1_000 * ONE - accrued);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE + 1_000 * ONE);
+}
+
+/// End is inclusive: the recipient transferred to on the end ledger receives
+/// the complete vested claim.
+#[test]
+fn transfer_at_end_moves_the_complete_claim() {
+    let h = Harness::new();
+    let start = h.now();
+    let end = start + 100 * DAY;
+    let id = h.create(1_000 * ONE, start, end, end, true, true, true);
+
+    h.warp_to(end);
+    h.client.transfer_recipient(&id, &h.other);
+
+    assert_eq!(h.client.withdraw(&id, &None), 1_000 * ONE);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE + 1_000 * ONE);
+}
+
+/// Once the end claim has been withdrawn, the stream is depleted. Transfer
+/// retries remain rejected and cannot redirect a second withdrawal.
+#[test]
+fn transfer_after_depletion_is_rejected_and_retry_is_stable() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.warp_to(T0 + 100 * DAY);
+    h.client.withdraw(&id, &None);
+
+    for _ in 0..2 {
+        let err = h
+            .client
+            .try_transfer_recipient(&id, &h.other)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, Error::StreamTerminated);
+    }
+    assert_eq!(h.get(id).recipient, h.recipient);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE);
+}
+
+#[test]
+fn retrying_a_transfer_is_idempotent() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.client.transfer_recipient(&id, &h.other);
+    let first_events = h.env.events().all().filter_by_contract(&h.contract_id);
+    assert_eq!(first_events.events().len(), 1);
+    assert_eq!(
+        first_events.events().last().unwrap(),
+        &events::RecipientTransferred {
+            stream_id: id,
+            old_recipient: h.recipient.clone(),
+            new_recipient: h.other.clone(),
+            sender: h.sender.clone(),
+        }
+        .to_xdr(&h.env, &h.contract_id),
+    );
+    assert_eq!(h.get(id).recipient, h.other);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE);
+
+    h.client.transfer_recipient(&id, &h.other);
+    let retry_events = h.env.events().all().filter_by_contract(&h.contract_id);
+    assert!(
+        retry_events.events().is_empty(),
+        "retry emits no state-changing event"
+    );
+    assert_eq!(h.get(id).recipient, h.other);
+    assert_eq!(h.balance(&h.recipient), 0);
+    assert_eq!(h.balance(&h.other), 1_000_000 * ONE);
+    h.assert_pool_exact();
 }
 
 // --- Guards ---------------------------------------------------------------

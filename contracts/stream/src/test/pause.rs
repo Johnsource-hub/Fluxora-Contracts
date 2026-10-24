@@ -1,3 +1,4 @@
+
 //! Stage 2 — pause and resume.
 //!
 //! The model: pausing freezes the stream's clock and pushes the effective end
@@ -6,6 +7,7 @@
 
 use super::common::*;
 use crate::{Error, StreamStatus};
+use proptest::prelude::*;
 
 #[test]
 fn pausing_freezes_accrual() {
@@ -138,6 +140,97 @@ fn repeated_pause_cycles_accumulate_correctly() {
     h.warp_to(T0 + 100 * DAY + expected_paused);
     assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
     h.assert_pool_exact();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::default())]
+
+    /// A pause immediately followed by a resume must be a no-op when the
+    /// ledger timestamp does not advance. Randomized preceding cycles ensure
+    /// the invariant also holds after the stream has already accumulated
+    /// paused time and accrued at different points in its schedule.
+    #[test]
+    fn zero_elapsed_pause_resume_preserves_stream_state(
+        seed in any::<u64>(),
+        operations in prop::collection::vec((0u8..4, 0u64..=3 * DAY), 0..=8),
+    ) {
+        let h = Harness::new();
+        let id = h.create_simple(1_000 * ONE, 365 * DAY);
+
+        for (kind, seconds) in operations {
+            match kind {
+                // Advance while remaining well inside the stream's schedule.
+                0 => h.advance(seconds),
+                // Exercise a normal pause/resume cycle before the zero-time
+                // assertion, so paused_total is not always zero.
+                1 => {
+                    h.client.pause(&id);
+                    h.advance(seconds);
+                    h.client.resume(&id);
+                }
+                // Include zero-time transitions at arbitrary points in the
+                // generated operation sequence as well as at its end.
+                2 => {
+                    let before = h.snapshot();
+                    let timestamp = h.now();
+                    h.client.pause(&id);
+                    h.client.resume(&id);
+                    prop_assert_eq!(
+                        h.now(),
+                        timestamp,
+                        "seed {}: pause/resume changed the ledger timestamp",
+                        seed,
+                    );
+                    prop_assert_eq!(
+                        h.snapshot(),
+                        before,
+                        "seed {}: zero-elapsed pause/resume changed stream state",
+                        seed,
+                    );
+                }
+                // A rejected second pause must preserve its original freeze
+                // point. This keeps the generated sequence sensitive to the
+                // pause-state guard while exercising the same lifecycle.
+                _ => {
+                    h.client.pause(&id);
+                    let freeze_point = h.get(id).paused_at;
+                    h.advance(seconds);
+                    prop_assert_eq!(
+                        h.client.try_pause(&id).unwrap_err().unwrap(),
+                        Error::StreamAlreadyPaused,
+                        "seed {}: a paused stream accepted a second pause",
+                        seed,
+                    );
+                    prop_assert_eq!(
+                        h.get(id).paused_at,
+                        freeze_point,
+                        "seed {}: rejected pause moved the freeze point",
+                        seed,
+                    );
+                    h.client.resume(&id);
+                }
+            }
+        }
+
+        // Force every generated case to exercise the behavior under test even
+        // when the random sequence contains no zero-time transition.
+        let before = h.snapshot();
+        let timestamp = h.now();
+        h.client.pause(&id);
+        h.client.resume(&id);
+        prop_assert_eq!(
+            h.now(),
+            timestamp,
+            "seed {}: pause/resume changed the ledger timestamp",
+            seed,
+        );
+        prop_assert_eq!(
+            h.snapshot(),
+            before,
+            "seed {}: zero-elapsed pause/resume changed stream state",
+            seed,
+        );
+    }
 }
 
 /// A pause that starts before the cliff and ends after it must not let the
@@ -863,4 +956,749 @@ fn state_machine_paused_for_full_lifetime_resumes_normally() {
     h.advance(50 * DAY);
     assert_eq!(h.client.vested_of(&id), 500 * ONE);
     h.assert_pool_exact();
+}
+
+// --- Issue #1832 — resume exactly at end_time ----------------------------------
+
+/// Resuming at exactly the wall-clock `end_time` is the specific case where
+/// `paused_total` arithmetic could push `elapsed` past `duration` if the
+/// stream-clock formula is wrong.
+///
+/// Scenario: a 100-day stream paused at day 30 (300 tokens vested, 700 still
+/// locked). The pause holds until the wall clock reaches `end_time`. At that
+/// point, `paused_total = 70 days`, so:
+///
+/// ```text
+/// stream_time(end_time) = end_time - paused_total
+///                       = start + 100d - 70d
+///                       = start + 30d
+/// elapsed               = 30 days   (must not overflow to > duration)
+/// vested                = 300 ONE
+/// refundable            = 700 ONE   (conservation exact)
+/// ```
+///
+/// The stream is still `Active` after resume — it has 70 days of stream-time
+/// left to run. Only after another 70 days of wall-clock time does it reach
+/// full maturity.
+///
+/// Acceptance criteria (issue #1832):
+///
+/// * Scenario exercised end-to-end through the public ABI.
+/// * Funds conservation `vested + refundable == deposited` asserted at the
+///   resume instant.
+/// * `resumed` event carries the correct `paused_duration` and `paused_total`.
+/// * Final stream state (`Depleted`) verified after full withdrawal.
+/// * `assert_pool_exact` called at the end.
+/// * The test fails if the behaviour it pins is changed.
+#[test]
+fn resume_exactly_at_end_time_conservation_and_final_state() {
+    use crate::events::Resumed;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::Event as _;
+
+    let h = Harness::new();
+    let duration = 100 * DAY;
+    let deposit = 1_000 * ONE;
+
+    // Create a 100-day pausable stream. start_time == T0.
+    let start = h.now();
+    let end = start + duration;
+    let id = h.create(deposit, start, end, start, true, true, true);
+
+    // Advance 30 days — 300 ONE vested, 700 ONE locked.
+    h.advance(30 * DAY);
+    assert_eq!(h.client.vested_of(&id), 300 * ONE);
+
+    // Pause here. Stream clock freezes at day 30.
+    h.client.pause(&id);
+    let pause_instant = h.now();
+    assert_eq!(pause_instant, start + 30 * DAY);
+    assert_eq!(h.get(id).paused_at, Some(pause_instant));
+
+    // Advance the wall clock to exactly the original end_time while paused.
+    // Accrual must not move — stream clock is frozen.
+    h.warp_to(end);
+    assert_eq!(h.now(), end, "wall clock must be exactly at end_time");
+    assert_eq!(
+        h.client.vested_of(&id),
+        300 * ONE,
+        "no accrual while paused even at original end_time"
+    );
+
+    // Resume at exactly end_time. This is the arithmetic boundary:
+    //   paused_duration = end_time - pause_instant = 70 days
+    //   paused_total    = 70 days (was 0 before)
+    //   stream_time     = end_time - paused_total = start + 30d (not beyond end_time)
+    //   elapsed         = 30 days  (not >= duration)
+    h.client.resume(&id);
+
+    // --- Event assertion ---------------------------------------------------
+    // Build the expected Resumed event from ground truth (post-call stream
+    // state) and compare byte-for-byte, matching the pattern in
+    // withdraw_events.rs / cancel_events.rs.
+    {
+        // The SDK retains events for the last invocation; capture before get_stream.
+        let published: std::vec::Vec<_> = h
+            .env
+            .events()
+            .all()
+            .filter_by_contract(&h.contract_id)
+            .events()
+            .to_vec();
+        let s_after = h.get(id);
+        let expected_event = Resumed {
+            recipient: h.recipient.clone(),
+            stream_id: id,
+            sender: h.sender.clone(),
+            // paused_duration = wall-clock delta from pause_instant to now
+            paused_duration: 70 * DAY,
+            // paused_total is the post-resume cumulative value stored in stream
+            paused_total: s_after.paused_total,
+            recipient: h.recipient.clone(),
+        };
+
+        assert_eq!(
+            published,
+            std::vec![expected_event.to_xdr(&h.env, &h.contract_id)],
+            "resume must emit exactly one Resumed event with the correct payload"
+        );
+
+        // Also verify the individual field against the expected value.
+        assert_eq!(
+            s_after.paused_total,
+            70 * DAY,
+            "paused_total must equal the 70-day pause duration"
+        );
+    }
+
+    // --- Post-resume stream state ------------------------------------------
+    let s = h.get(id);
+    assert_eq!(
+        s.status,
+        StreamStatus::Active,
+        "stream must be Active after resume"
+    );
+    assert_eq!(s.paused_at, None, "paused_at must be cleared");
+    assert_eq!(
+        s.paused_total,
+        70 * DAY,
+        "paused_total must absorb the 70-day pause"
+    );
+
+    // --- Conservation at the resume instant --------------------------------
+    // Invariant I4: vested + refundable == deposited, exactly.
+    let vested_now = h.client.vested_of(&id);
+    let refundable_now = h.client.refundable_of(&id);
+    assert_eq!(
+        vested_now,
+        300 * ONE,
+        "vested must equal the amount accrued before the pause"
+    );
+    assert_eq!(
+        refundable_now,
+        700 * ONE,
+        "refundable must be the remainder"
+    );
+    assert_eq!(
+        vested_now + refundable_now,
+        deposit,
+        "vested + refundable must equal deposited (conservation I4)"
+    );
+
+    // withdrawable == vested - withdrawn == 300 ONE (nothing withdrawn yet)
+    assert_eq!(
+        h.client.withdrawable_of(&id),
+        300 * ONE,
+        "withdrawable must equal vested at this point"
+    );
+
+    // --- Partial withdrawal while the stream still has time left -----------
+    // The stream is Active but the clock is at stream-day 30. Withdraw what
+    // is available now to prove the stream is not stuck in a terminal state.
+    let paid = h.client.withdraw(&id, &None);
+    assert_eq!(
+        paid,
+        300 * ONE,
+        "first withdrawal must be the pre-pause accrual"
+    );
+    assert_eq!(h.balance(&h.recipient), 300 * ONE);
+    assert_eq!(
+        h.get(id).status,
+        StreamStatus::Active,
+        "stream remains Active — 70 days of stream-time remain"
+    );
+    h.assert_pool_exact();
+
+    // --- Accrual resumes correctly after the resume call -------------------
+    // Advancing 35 more wall-clock days adds 35 days of stream time (no more
+    // pauses), so vested goes from 300 to 650 ONE.
+    h.advance(35 * DAY);
+    assert_eq!(
+        h.client.vested_of(&id),
+        650 * ONE,
+        "vested must advance at the original rate after resume"
+    );
+
+    // --- Stream fully matures at end_time + paused_total -------------------
+    // The stretched end is end_time + paused_total = start + 100d + 70d = start + 170d.
+    // Current wall clock: end_time + 35d = start + 135d.  35d remain.
+    h.advance(35 * DAY);
+    // Wall clock is now start + 170d.  Stream clock = 170d - 70d = 100d == duration.
+    assert_eq!(
+        h.client.vested_of(&id),
+        1_000 * ONE,
+        "stream must be fully vested at the stretched end time"
+    );
+    assert_eq!(
+        h.client.withdrawable_of(&id),
+        700 * ONE,
+        "withdrawable must be the remaining 700 ONE"
+    );
+    h.assert_pool_exact();
+
+    // --- Final withdrawal drains the stream to Depleted --------------------
+    let final_paid = h.client.withdraw(&id, &None);
+    assert_eq!(
+        final_paid,
+        700 * ONE,
+        "final withdrawal must collect the remaining deposit"
+    );
+    assert_eq!(
+        h.balance(&h.recipient),
+        1_000 * ONE,
+        "recipient must hold the full deposit"
+    );
+
+    let s_final = h.get(id);
+    assert_eq!(
+        s_final.status,
+        StreamStatus::Depleted,
+        "stream must become Depleted after the last withdrawal"
+    );
+    assert_eq!(s_final.withdrawn, deposit, "withdrawn must equal deposited");
+    assert_eq!(
+        s_final.paused_at, None,
+        "no open pause on a terminal stream"
+    );
+
+    // Pool must be empty — every token has been paid to the recipient.
+    h.assert_pool_exact();
+}
+
+/// Sharper variant of the end_time resume: the stream is paused at
+/// `start_time` itself (zero stream-time elapsed) and the resume call lands
+/// exactly at `end_time`. This maximises `paused_total` to `duration`, so
+/// `stream_time(end_time) == start_time` and `elapsed == 0`.
+///
+/// Guards the saturating-subtraction boundary: `paused_total == duration`
+/// must yield `stream_time == start_time`, not an underflow or wrap.
+#[test]
+fn resume_at_end_time_with_full_duration_paused() {
+    let h = Harness::new();
+    let duration = 100 * DAY;
+    let deposit = 1_000 * ONE;
+
+    let start = h.now();
+    let end = start + duration;
+    let id = h.create(deposit, start, end, start, true, true, true);
+
+    // Pause immediately at creation — zero stream-time elapsed.
+    h.client.pause(&id);
+    assert_eq!(h.client.vested_of(&id), 0);
+    assert_eq!(h.get(id).paused_at, Some(start));
+
+    // Advance exactly to end_time.
+    h.warp_to(end);
+    assert_eq!(h.client.vested_of(&id), 0, "no accrual during full pause");
+
+    // Resume. paused_total = end_time - start = duration = 100 days.
+    // stream_time(end) = end - paused_total = start. elapsed = 0.
+    h.client.resume(&id);
+
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Active);
+    assert_eq!(s.paused_at, None);
+    assert_eq!(s.paused_total, duration);
+
+    // Conservation: vested(0) + refundable(deposited) == deposited.
+    assert_eq!(h.client.vested_of(&id), 0);
+    assert_eq!(h.client.refundable_of(&id), deposit);
+    assert_eq!(
+        h.client.vested_of(&id) + h.client.refundable_of(&id),
+        deposit,
+        "conservation must hold immediately after resume"
+    );
+
+    // The stream must run its full 100 days from the resumed point.
+    h.advance(duration);
+    assert_eq!(
+        h.client.vested_of(&id),
+        deposit,
+        "stream fully vests after the complete duration from the resume point"
+    );
+    assert_eq!(h.client.withdraw(&id, &None), deposit);
+    assert_eq!(h.get(id).status, StreamStatus::Depleted);
+    h.assert_pool_exact();
+}
+
+// --- Boundary behaviour of `pause` -----------------------------------------
+//
+// `pause` takes no numeric arguments, so the boundaries that matter are the
+// stream-clock values at which it is invoked: zero elapsed, one second
+// elapsed, the maximum accepted elapsed time (exactly `end_time`), and one
+// past it. Each case must either succeed or be refused with a typed error —
+// never panic.
+
+/// Pause at zero elapsed stream time (the creation instant). This is the
+/// lower boundary: `paused_at == start_time`, `paused_total == 0`.
+#[test]
+fn pause_boundary_zero_elapsed() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Zero seconds elapsed since creation.
+    h.client.pause(&id);
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Paused);
+    assert_eq!(s.paused_at, Some(T0));
+    assert_eq!(s.paused_total, 0);
+    assert_eq!(h.client.vested_of(&id), 0);
+
+    // Resume immediately: zero-duration pause must not be recorded.
+    h.client.resume(&id);
+    assert_eq!(h.get(id).paused_total, 0);
+    assert_eq!(h.get(id).status, StreamStatus::Active);
+    h.assert_pool_exact();
+}
+
+/// Pause after exactly one second of stream time. The smallest non-zero
+/// elapsed value must be handled without off-by-one drift.
+#[test]
+fn pause_boundary_one_second_elapsed() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.advance(1);
+    h.client.pause(&id);
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Paused);
+    assert_eq!(s.paused_at, Some(T0 + 1));
+    assert_eq!(s.paused_total, 0);
+
+    // One second of stream time has accrued (rate is 10 ONE/day).
+    assert_eq!(h.client.vested_of(&id), 10 * ONE / (DAY / 1));
+
+    h.advance(1);
+    h.client.resume(&id);
+    assert_eq!(h.get(id).paused_total, 1);
+    assert_eq!(h.get(id).status, StreamStatus::Active);
+    h.assert_pool_exact();
+}
+
+/// Pause at exactly `end_time` — the maximum accepted stream-clock value.
+/// The stream is fully vested; pausing must succeed and freeze at maturity.
+#[test]
+fn pause_boundary_at_max_accepted_time() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    let end = T0 + 100 * DAY;
+
+    h.warp_to(end);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    // Pausing at exactly end_time must succeed.
+    h.client.pause(&id);
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Paused);
+    assert_eq!(s.paused_at, Some(end));
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    // Resume and confirm the stream remains fully matured.
+    h.advance(DAY);
+    h.client.resume(&id);
+    assert_eq!(h.get(id).paused_total, DAY);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+    assert_eq!(h.client.withdraw(&id, &None), 1_000 * ONE);
+    h.assert_pool_exact();
+}
+
+/// One second past `end_time`: the stream is already matured, so pausing must
+/// still succeed (it is not a terminal state) and must not panic or overflow.
+/// The refusal path here is `resume` on a depleted stream, not `pause`.
+#[test]
+fn pause_boundary_one_past_max_accepted_time() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    let end = T0 + 100 * DAY;
+
+    h.warp_to(end + 1);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    // Pausing one second past end_time must not panic.
+    h.client.pause(&id);
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Paused);
+    assert_eq!(s.paused_at, Some(end + 1));
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    // Drain while paused: depletion is terminal and closes the pause.
+    assert_eq!(h.client.withdraw(&id, &None), 1_000 * ONE);
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Depleted);
+    assert_eq!(s.paused_at, None);
+
+    // Every subsequent transition is a typed error, never a panic.
+    assert_eq!(
+        h.client.try_pause(&id).unwrap_err().unwrap(),
+        Error::StreamTerminated,
+    );
+    assert_eq!(
+        h.client.try_resume(&id).unwrap_err().unwrap(),
+        Error::StreamTerminated,
+    );
+    h.assert_pool_exact();
+}
+
+
+// --- Issue: pause coverage across every stream status ----------------------
+//
+// `pause` behaves differently depending on the status of the stream it
+// touches. These tests drive `pause` from each status (Active, Paused,
+// Cancelled, Matured) and assert the outcome as a value or a typed error.
+// A refused call must not mutate a terminal stream.
+
+/// Active → Paused: pausing an active stream succeeds and freezes the clock.
+#[test]
+fn pause_from_active_status_succeeds_and_freezes_clock() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.advance(30 * DAY);
+    assert_eq!(h.get(id).status, StreamStatus::Active);
+    let vested_before = h.client.vested_of(&id);
+
+    h.client.pause(&id);
+
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Paused);
+    assert_eq!(s.paused_at, Some(T0 + 30 * DAY));
+    assert_eq!(s.paused_total, 0);
+    assert_eq!(h.client.vested_of(&id), vested_before);
+
+    // Clock is frozen: further wall-clock time does not accrue.
+    h.advance(50 * DAY);
+    assert_eq!(h.client.vested_of(&id), vested_before);
+    h.assert_pool_exact();
+}
+
+/// Paused → Paused: a second pause is refused with `StreamAlreadyPaused` and
+/// must not move the freeze point or mutate the stream.
+#[test]
+fn pause_from_paused_status_is_rejected_without_mutation() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.advance(30 * DAY);
+    h.client.pause(&id);
+    let before = h.get(id);
+    assert_eq!(before.status, StreamStatus::Paused);
+
+    h.advance(20 * DAY);
+    let err = h.client.try_pause(&id).unwrap_err().unwrap();
+    assert_eq!(err, Error::StreamAlreadyPaused);
+
+    let after = h.get(id);
+    assert_eq!(after.status, StreamStatus::Paused);
+    assert_eq!(after.paused_at, before.paused_at, "freeze point unchanged");
+    assert_eq!(after.paused_total, before.paused_total);
+    assert_eq!(after.withdrawn, before.withdrawn);
+    h.assert_pool_exact();
+}
+
+/// Cancelled → Cancelled: pausing a cancelled stream is refused with
+/// `StreamTerminated` and leaves the settled stream untouched.
+#[test]
+fn pause_from_cancelled_status_is_rejected_without_mutation() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    let sender_before = h.balance(&h.sender);
+
+    h.advance(30 * DAY);
+    h.client.cancel(&id);
+    let before = h.get(id);
+    assert_eq!(before.status, StreamStatus::Cancelled);
+
+    let err = h.client.try_pause(&id).unwrap_err().unwrap();
+    assert_eq!(err, Error::StreamTerminated);
+
+    let after = h.get(id);
+    assert_eq!(after.status, StreamStatus::Cancelled);
+    assert_eq!(after.paused_at, None, "no pause state on a terminal stream");
+    assert_eq!(after.paused_total, before.paused_total);
+    assert_eq!(after.withdrawn, before.withdrawn);
+    assert_eq!(h.balance(&h.sender), sender_before + 700 * ONE);
+    h.assert_pool_exact();
+}
+
+/// Matured → Matured: pausing a matured stream is accepted as a no-op. The
+/// stream stays fully vested and no accrual is affected by the pause.
+#[test]
+fn pause_from_matured_status_is_a_noop() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.warp_to(T0 + 150 * DAY);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    h.client.pause(&id);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    // Wall clock advances while paused — still fully vested, not more.
+    h.advance(50 * DAY);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    h.client.resume(&id);
+    assert_eq!(h.client.vested_of(&id), 1_000 * ONE);
+
+    assert_eq!(h.client.withdraw(&id, &None), 1_000 * ONE);
+    assert_eq!(h.get(id).status, StreamStatus::Depleted);
+    h.assert_pool_exact();
+}
+
+/// Depleted → Depleted: pausing a depleted stream is refused with
+/// `StreamTerminated` and leaves the terminal stream untouched.
+#[test]
+fn pause_from_depleted_status_is_rejected_without_mutation() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 10 * DAY);
+
+    h.advance(10 * DAY);
+    h.client.withdraw(&id, &None);
+    let before = h.get(id);
+    assert_eq!(before.status, StreamStatus::Depleted);
+
+    let err = h.client.try_pause(&id).unwrap_err().unwrap();
+    assert_eq!(err, Error::StreamTerminated);
+
+    let after = h.get(id);
+    assert_eq!(after.status, StreamStatus::Depleted);
+    assert_eq!(after.paused_at, None, "no pause state on a terminal stream");
+    assert_eq!(after.paused_total, before.paused_total);
+    assert_eq!(after.withdrawn, before.withdrawn);
+    h.assert_pool_exact();
+}
+// ---------------------------------------------------------------------------
+// Double-pause: idempotency / rejection coverage
+//
+// A client that retries after a network timeout will call `pause` twice on a
+// stream that is already `Paused`. These three tests together cover the three
+// acceptance criteria:
+//
+//   (a) state is byte-for-byte identical after the rejected second call
+//   (b) token balances are unaffected by both calls
+//   (c) exactly one `Paused` event is emitted for the first call; none for the
+//       second
+// ---------------------------------------------------------------------------
+
+/// (a) The full stream record is unchanged by a rejected double-pause.
+///
+/// This pins that none of the accounting fields (`paused_at`, `paused_total`,
+/// `status`, `withdrawn`, `deposited`, `end_time`, …) is mutated by the second
+/// call. The freeze point must stay at the original `pause` instant; in
+/// particular `paused_at` must not be overwritten with the later timestamp.
+#[test]
+fn double_pause_is_idempotent_state() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Accrue for 30 days, then pause. Record the stream state immediately after.
+    h.advance(30 * DAY);
+    h.client.pause(&id);
+    let state_after_first_pause = h.get(id);
+
+    // Advance time to simulate a retry from a different ledger.
+    h.advance(5 * DAY);
+
+    // The second call must be refused.
+    let err = h.client.try_pause(&id).unwrap_err().unwrap();
+    assert_eq!(
+        err,
+        Error::StreamAlreadyPaused,
+        "second pause must return StreamAlreadyPaused"
+    );
+
+    // Every field must be identical to what was stored right after the first pause.
+    let state_after_second_attempt = h.get(id);
+    assert_eq!(
+        state_after_second_attempt.status, state_after_first_pause.status,
+        "status must not change"
+    );
+    assert_eq!(
+        state_after_second_attempt.paused_at, state_after_first_pause.paused_at,
+        "paused_at must not move to the retry timestamp"
+    );
+    assert_eq!(
+        state_after_second_attempt.paused_total, state_after_first_pause.paused_total,
+        "paused_total must not change"
+    );
+    assert_eq!(
+        state_after_second_attempt.deposited, state_after_first_pause.deposited,
+        "deposited must not change"
+    );
+    assert_eq!(
+        state_after_second_attempt.withdrawn, state_after_first_pause.withdrawn,
+        "withdrawn must not change"
+    );
+    assert_eq!(
+        state_after_second_attempt.end_time, state_after_first_pause.end_time,
+        "end_time must not change"
+    );
+
+    // Resuming still picks up from the original freeze instant, not the retry time.
+    h.client.resume(&id);
+    // Paused for 5 days (from first pause to resume), not 10 (which it would
+    // be if the freeze point had been overwritten by the second attempt).
+    assert_eq!(
+        h.get(id).paused_total,
+        5 * DAY,
+        "paused_total must reflect the original freeze point, not the retry time"
+    );
+    h.assert_pool_exact();
+}
+
+/// (b) Token balances — sender, recipient and pool — are unaffected by both
+/// the first pause and the rejected second pause.
+///
+/// `pause` freezes the *clock*, not the tokens. No transfer ever happens on
+/// either call. This test records balances before the first pause and asserts
+/// they are unchanged after both calls.
+#[test]
+fn double_pause_token_balances_unchanged() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Let some time pass so the stream has a non-trivial state.
+    h.advance(40 * DAY);
+
+    // Snapshot all relevant balances before the first pause.
+    let sender_before = h.balance(&h.sender);
+    let recipient_before = h.balance(&h.recipient);
+    let pool_before = h.pool();
+
+    // First pause — must succeed.
+    h.client.pause(&id);
+
+    // Balances must not have moved.
+    assert_eq!(
+        h.balance(&h.sender),
+        sender_before,
+        "sender balance must not change on pause"
+    );
+    assert_eq!(
+        h.balance(&h.recipient),
+        recipient_before,
+        "recipient balance must not change on pause"
+    );
+    assert_eq!(
+        h.pool(),
+        pool_before,
+        "pool balance must not change on pause"
+    );
+
+    // Advance a bit and retry.
+    h.advance(3 * DAY);
+
+    // Second pause — must be refused.
+    assert_eq!(
+        h.client.try_pause(&id).unwrap_err().unwrap(),
+        Error::StreamAlreadyPaused,
+    );
+
+    // Balances must still be unchanged after the rejected second call.
+    assert_eq!(
+        h.balance(&h.sender),
+        sender_before,
+        "sender balance must not change on rejected second pause"
+    );
+    assert_eq!(
+        h.balance(&h.recipient),
+        recipient_before,
+        "recipient balance must not change on rejected second pause"
+    );
+    assert_eq!(
+        h.pool(),
+        pool_before,
+        "pool balance must not change on rejected second pause"
+    );
+
+    // Pool invariant: the pool still exactly covers the outstanding liability.
+    h.assert_pool_exact();
+}
+
+/// (c) Event discipline for a double-pause: exactly one `Paused` event on the
+/// first call; no event at all on the rejected second call.
+///
+/// The event buffer is checked immediately after each call, before any other
+/// client call can replace the snapshot. The first call's event payload is
+/// verified byte-for-byte against the post-call stream state (independent
+/// ground truth). The second call's buffer must be empty.
+#[test]
+fn double_pause_event_assertions() {
+    use crate::events::Paused;
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::Event as _;
+
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(25 * DAY);
+
+    // --- First pause: exactly one Paused event ----------------------------
+    h.client.pause(&id);
+
+    // Collect events emitted by the stream contract during this invocation.
+    // Must be done before any other client call resets the event buffer.
+    let events_first: std::vec::Vec<_> = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.contract_id)
+        .events()
+        .to_vec();
+
+    // Build the expected event from independent ground truth (stream in storage).
+    let s = h.get(id);
+    let expected_paused = Paused {
+        stream_id: id,
+        sender: h.sender.clone(),
+        paused_at: s.paused_at.expect("paused_at must be set after pause"),
+        paused_total: s.paused_total,
+        recipient: h.recipient.clone(),
+    };
+
+    assert_eq!(
+        events_first,
+        std::vec![expected_paused.to_xdr(&h.env, &h.contract_id)],
+        "first pause must emit exactly one Paused event with the correct payload"
+    );
+
+    // Verify the individual event fields against independent ground truth.
+    assert_eq!(s.paused_total, 0, "paused_total must be 0 on first pause");
+
+    // --- Second pause (retry): no event must be emitted ------------------
+    h.advance(7 * DAY);
+    let _ = h.client.try_pause(&id); // returns StreamAlreadyPaused, ignored here
+
+    let events_second: std::vec::Vec<_> = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.contract_id)
+        .events()
+        .to_vec();
+
+    assert!(
+        events_second.is_empty(),
+        "rejected second pause must not emit any event; got {count} event(s)",
+        count = events_second.len()
+    );
 }
